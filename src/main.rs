@@ -1,12 +1,15 @@
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{generate, Generator, Shell};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+// ─────────────────────────────────────────────────────────────────────────────
 // ASCII art banner for CLI help output
+// ─────────────────────────────────────────────────────────────────────────────
 const BANNER: &str = r#"
 ⠀⠀⠀⠀⠀⠀⢀⣀⣀⣀⣀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠺⢿⣿⣿⣿⣿⣿⣿⣷⣦⣠⣤⣤⣤⣄⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀
@@ -25,6 +28,27 @@ const BANNER: &str = r#"
 ⠈⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 "#;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants & colors
+// ─────────────────────────────────────────────────────────────────────────────
+const SUDO_BIN: &str = "sudo";
+const ENV_ELEVATED_FLAG: &str = "CORKY_ELEVATED"; // prevents re-entrancy loops
+const BIN_PATH_SYSTEM: &str = "/usr/local/bin";
+const UNIT_DIR_SYSTEM: &str = "/etc/systemd/system";
+
+const C_RESET: &str = "\x1b[0m";
+const C_BOLD: &str = "\x1b[1m";
+const C_GREEN: &str = "\x1b[32m";
+const C_BGREEN: &str = "\x1b[1;32m";
+const C_RED: &str = "\x1b[31m";
+const C_YELLOW: &str = "\x1b[33m";
+const C_BLUE: &str = "\x1b[34m";
+const C_WHITE: &str = "\x1b[37m";
+const C_CYAN: &str = "\x1b[36m";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI
+// ─────────────────────────────────────────────────────────────────────────────
 #[derive(Parser)]
 #[command(name = "corky", version = "0.1.0", author = "Your Name", about = "Corky CLI manager")]
 #[command(before_help = BANNER)]
@@ -37,13 +61,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Install corky services
+    /// Install corky services (system service)
     Install {
         /// Run in dry-run mode (no actual changes made)
         #[arg(long)]
         dry_run: bool,
     },
-    /// Uninstall corky services
+    /// Uninstall corky services (system service)
     Uninstall {
         /// Run in dry-run mode (no actual changes made)
         #[arg(long)]
@@ -52,43 +76,36 @@ enum Commands {
     /// View logs for a corky service
     Logs {
         /// Name of the service to view logs for
-        #[arg(value_enum)]
         service: Option<ServiceName>,
     },
     /// Check status of a corky service
     Status {
         /// Name of the service to check status for
-        #[arg(value_enum)]
         service: Option<ServiceName>,
     },
     /// Start a corky service
     Start {
         /// Name of the service to start
-        #[arg(value_enum)]
         service: Option<ServiceName>,
     },
     /// Stop a corky service
     Stop {
         /// Name of the service to stop
-        #[arg(value_enum)]
         service: Option<ServiceName>,
     },
     /// Restart a corky service
     Restart {
         /// Name of the service to restart
-        #[arg(value_enum)]
         service: Option<ServiceName>,
     },
     /// Enable a corky service
     Enable {
         /// Name of the service to enable
-        #[arg(value_enum)]
         service: Option<ServiceName>,
     },
     /// Disable a corky service
     Disable {
         /// Name of the service to disable
-        #[arg(value_enum)]
         service: Option<ServiceName>,
     },
     /// List all corky services
@@ -96,7 +113,6 @@ enum Commands {
     /// Generate shell completion scripts
     Completion {
         /// Shell to generate completions for
-        #[arg(value_enum)]
         shell: Shell,
     },
     /// Print tab completion for shell - used internally by completion scripts
@@ -110,20 +126,14 @@ enum Commands {
 /// Service name specification - can be a special value or a custom service name
 #[derive(Debug, Clone)]
 enum ServiceName {
-    /// Automatically select the service if only one is available
     Auto,
-    /// Show information for all services
     All,
-    /// Interactively select a service
     Interactive,
-    /// A specific service name (can be full name or partial)
     Custom(String),
 }
 
-// Custom string parsing for ServiceName
 impl std::str::FromStr for ServiceName {
     type Err = String;
-
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "auto" => Ok(ServiceName::Auto),
@@ -134,7 +144,6 @@ impl std::str::FromStr for ServiceName {
     }
 }
 
-// Display implementation for ServiceName
 impl std::fmt::Display for ServiceName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -146,7 +155,9 @@ impl std::fmt::Display for ServiceName {
     }
 }
 
-/// Check if the current process is running with root privileges
+// ─────────────────────────────────────────────────────────────────────────────
+// Privilege helpers
+// ─────────────────────────────────────────────────────────────────────────────
 fn is_root() -> bool {
     #[cfg(unix)]
     {
@@ -154,98 +165,59 @@ fn is_root() -> bool {
     }
     #[cfg(not(unix))]
     {
-        false // On non-unix platforms, assume not root
+        false
     }
 }
 
-/// Restart the current process with elevated privileges
-fn elevate_privileges(args: &[String]) -> ! {
-    println!("{}", "This operation requires root privileges.");
-    
-    // Construct the command to run with sudo
-    let status = Command::new("sudo")
-        .arg(env::current_exe().expect("Failed to get current executable path"))
-        .args(args)
+/// Prime sudo timestamp so the password is asked at most once per sudo session timeout.
+fn ensure_sudo_timestamp() {
+    if is_root() {
+        return;
+    }
+    let _ = Command::new(SUDO_BIN)
+        .arg("-v")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
-        .expect("Failed to execute sudo command");
-    
+        .status();
+}
+
+/// Restart the current process with elevated privileges (re-exec via sudo).
+/// Uses an env flag to avoid recursion loops if the elevated run calls this again.
+fn elevate_privileges(args: &[String]) -> ! {
+    if env::var_os(ENV_ELEVATED_FLAG).is_some() {
+        eprintln!("{C_RED}Elevation loop detected; aborting.{C_RESET}");
+        std::process::exit(1);
+    }
+    ensure_sudo_timestamp();
+    let exe = env::current_exe().expect("Failed to get current executable path");
+    let cwd = env::current_dir().ok();
+
+    let mut cmd = Command::new(SUDO_BIN);
+    cmd.env(ENV_ELEVATED_FLAG, "1")
+        .arg(exe)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    if let Some(dir) = cwd {
+        let _ = cmd.current_dir(dir);
+    }
+
+    let status = cmd.status().expect("Failed to execute sudo re-exec");
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Determine if the given command requires root privileges
-fn requires_root(command: &Commands) -> bool {
-    match command {
-        Commands::Install { .. } => true,
-        Commands::Uninstall { .. } => true,
-        Commands::Start { service } => {
-            // Only require root for system services
-            if let Some(service_name) = service {
-                if matches!(service_name, ServiceName::All) {
-                    return true; // All includes system services
-                }
-            }
-            // We'll check more specifically in run_systemctl
-            false
-        },
-        Commands::Stop { service } => {
-            if let Some(service_name) = service {
-                if matches!(service_name, ServiceName::All) {
-                    return true;
-                }
-            }
-            false
-        },
-        Commands::Restart { service } => {
-            if let Some(service_name) = service {
-                if matches!(service_name, ServiceName::All) {
-                    return true;
-                }
-            }
-            false
-        },
-        Commands::Enable { service } => {
-            if let Some(service_name) = service {
-                if matches!(service_name, ServiceName::All) {
-                    return true;
-                }
-            }
-            false
-        },
-        Commands::Disable { service } => {
-            if let Some(service_name) = service {
-                if matches!(service_name, ServiceName::All) {
-                    return true;
-                }
-            }
-            false
-        },
-        // These commands don't modify system state, so they don't need root
-        Commands::Logs { .. } => false,
-        Commands::Status { .. } => false,
-        Commands::List => false,
-        Commands::Completion { .. } => false,
-        Commands::CompletionItems { .. } => false,
-    }
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
 fn main() {
     let cli = Cli::parse();
-    
-    // Check if we need root privileges for this command
-    if requires_root(&cli.command) && !is_root() {
-        // Get the original command line arguments
-        let args: Vec<String> = env::args().collect();
-        
-        // Re-execute with sudo
-        elevate_privileges(&args[1..]);
-    }
-    
+
     match &cli.command {
-        Commands::Install { dry_run } => run_embedded_script("install", *dry_run),
-        Commands::Uninstall { dry_run } => run_embedded_script("uninstall", *dry_run),
+        Commands::Install { dry_run } => install_system_service(*dry_run),
+        Commands::Uninstall { dry_run } => uninstall_system_service(*dry_run),
         Commands::Logs { service } => {
             let service_info = resolve_service(service.clone());
             run_systemctl_logs(&service_info);
@@ -275,8 +247,7 @@ fn main() {
             run_systemctl("disable", &service_info);
         }
         Commands::List => {
-            println!("Available Corky Services:");
-            println!("-------------------------");
+            println!("{}Available Corky Services:{}\n-------------------------", C_BOLD, C_RESET);
             for (service, scope) in list_corky_services() {
                 println!("  {} ({})", service, scope);
             }
@@ -285,9 +256,7 @@ fn main() {
             generate_completion(*shell);
         }
         Commands::CompletionItems { cmd: _ } => {
-            // List available service names for tab completion
-            for (service, _) in list_corky_services() {
-                // Strip 'corky-' prefix for better user experience
+                for (service, _) in list_corky_services() {
                 let service_name = service.replace("corky-", "");
                 println!("{}", service_name);
             }
@@ -295,107 +264,349 @@ fn main() {
     }
 }
 
-/// Embedded install and uninstall scripts
-const INSTALL_SCRIPT: &str = include_str!("../cmds/install.sh");
-const UNINSTALL_SCRIPT: &str = include_str!("../cmds/uninstall.sh");
+// ─────────────────────────────────────────────────────────────────────────────
+// INSTALL / UNINSTALL (Pure Rust) — no empty sections
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Writes embedded script to a temp file and executes it from PWD
-fn run_embedded_script(name: &str, dry_run: bool) {
-    // Check for root privileges for install/uninstall operations
+fn install_system_service(dry_run: bool) {
+    // Phase 1 (user): validate + build, then elevate. No empty "Elevation" section.
     if !is_root() {
-        println!("This operation requires root privileges.");
-        
-        // Get the original command line arguments
-        let args: Vec<String> = env::args().collect();
-        
-        // Re-execute with sudo
-        elevate_privileges(&args[1..]);
+        section("Validating Corky package");
+        validate_corky_package_or_exit();
+        println!("{C_BGREEN}[OK]{C_RESET} {C_WHITE}Found Cargo.toml with [corky] is_corky_package=true{C_RESET}");
+
+        section("Building (release)");
+        if dry_run {
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: cargo build --release");
+        } else {
+            println!("{C_GREEN}[INFO]{C_RESET} Running: cargo build --release");
+            let status = Command::new("cargo")
+                .arg("build")
+                .arg("--release")
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .expect("Failed to run cargo build --release");
+            if !status.success() {
+                eprintln!("{C_RED}[ERROR]{C_RESET} cargo build --release failed.");
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+
+        // Single, informative line instead of an empty heading
+        println!("{C_GREEN}[INFO]{C_RESET} Elevating with sudo to install system service…");
+        let mut args: Vec<String> = env::args().skip(1).collect();
+        if dry_run && !args.iter().any(|x| x == "--dry-run") {
+            args.push("--dry-run".to_string());
+        }
+        elevate_privileges(&args);
     }
-    
-    // Check for Cargo.toml before executing
-    let cargo_path = std::path::Path::new("Cargo.toml");
-    if !cargo_path.exists() {
-        eprintln!("Error: No Cargo.toml found in the current directory.");
+
+    // Phase 2 (root): install only — no duplicate validation/build sections
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let (pkg_name, description) = pkg_name_and_description().unwrap_or_else(|| {
+        eprintln!("{C_YELLOW}[WARN]{C_RESET} Using fallback metadata (could not read Cargo.toml).");
+        ("corky".to_string(), "corky service".to_string())
+    });
+
+    let target_bin = Path::new("target").join("release").join(&pkg_name);
+    let install_bin = Path::new(BIN_PATH_SYSTEM).join(&pkg_name);
+    let unit_path = Path::new(UNIT_DIR_SYSTEM).join(format!("{}.service", &pkg_name));
+
+    section("Installing binary");
+    if dry_run {
+        println!(
+            "{C_CYAN}[DRY-RUN]{C_RESET} Would install: {} -> {} (0755)",
+            target_bin.display(),
+            install_bin.display()
+        );
+    } else {
+        let data = fs::read(&target_bin).unwrap_or_else(|e| {
+            eprintln!("{C_RED}[ERROR]{C_RESET} Read {}: {}", target_bin.display(), e);
+            std::process::exit(1);
+        });
+        fs::create_dir_all(BIN_PATH_SYSTEM).unwrap_or_else(|e| {
+            eprintln!("{C_RED}[ERROR]{C_RESET} create {}: {}", BIN_PATH_SYSTEM, e);
+            std::process::exit(1);
+        });
+        fs::write(&install_bin, &data).unwrap_or_else(|e| {
+            eprintln!("{C_RED}[ERROR]{C_RESET} write {}: {}", install_bin.display(), e);
+            std::process::exit(1);
+        });
+        let mut perms = fs::metadata(&install_bin)
+            .map(|m| m.permissions())
+            .unwrap_or_else(|e| {
+                eprintln!("{C_RED}[ERROR]{C_RESET} stat {}: {}", install_bin.display(), e);
+                std::process::exit(1);
+            });
+        perms.set_mode(0o755);
+        fs::set_permissions(&install_bin, perms).unwrap_or_else(|e| {
+            eprintln!("{C_RED}[ERROR]{C_RESET} chmod {}: {}", install_bin.display(), e);
+            std::process::exit(1);
+        });
+        println!("{C_GREEN}[INFO]{C_RESET} Installed: {}", install_bin.display());
+    }
+
+    section("Writing systemd unit");
+    let working_dir = if cwd.is_dir() { cwd } else { PathBuf::from("/") };
+    let unit_contents = format!(
+        r#"[Unit]
+Description={description}
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User={user}
+Group={user}
+WorkingDirectory={workdir}
+ExecStart={exec_path}
+ExecStartPre=/usr/bin/test -x {exec_path}
+Restart=on-failure
+RestartSec=1
+ProtectHome=no
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        description = description,
+        user = installing_user(),
+        workdir = working_dir.display(),
+        exec_path = install_bin.display(),
+    );
+
+    if dry_run {
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would write unit: {}", unit_path.display());
+        println!("---------- unit file ----------\n{}\n-------------------------------", unit_contents);
+    } else {
+        fs::write(&unit_path, unit_contents).unwrap_or_else(|e| {
+            eprintln!("{C_RED}[ERROR]{C_RESET} write {}: {}", unit_path.display(), e);
+            std::process::exit(1);
+        });
+        // Best-effort SELinux relabel
+        let _ = Command::new("restorecon").arg("-v").arg(&unit_path).status();
+        let _ = Command::new("restorecon").arg("-v").arg(&install_bin).status();
+        println!("{C_GREEN}[INFO]{C_RESET} Wrote unit: {}", unit_path.display());
+    }
+
+    section("Reloading & enabling service");
+    if dry_run {
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl enable {}", pkg_name);
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl start {}", pkg_name);
+        return;
+    }
+    run_cmd_expect_ok("systemctl", &["daemon-reload"]);
+    run_cmd_expect_ok("systemctl", &["enable", &pkg_name]);
+    let ok = run_cmd("systemctl", &["start", &pkg_name]);
+    if !ok {
+        eprintln!("{C_RED}[ERROR]{C_RESET} Failed to start service. Try: systemctl status {}", pkg_name);
         std::process::exit(1);
     }
-    
-    // Validate that the Cargo.toml has [corky] section with is_corky_package = true
-    if name == "install" {
-        let cargo_content = fs::read_to_string(cargo_path)
-            .expect("Failed to read Cargo.toml");
-            
-        // Check for [corky] section with is_corky_package = true
-        let has_corky_section = cargo_content.contains("[corky]")
-            && cargo_content.contains("is_corky_package = true");
-            
-        if !has_corky_section {
-            eprintln!("\x1b[1;31mError: This does not appear to be a Corky package.\x1b[0m");
-            eprintln!("Only Corky packages can be installed with this script.");
-            eprintln!("A Corky package must have [corky] section with is_corky_package = true in Cargo.toml.");
-            std::process::exit(1);
+
+    section("Done");
+    println!("{C_BGREEN}[SUCCESS]{C_RESET} {} installed and started.", pkg_name);
+    println!("• Binary: {}", install_bin.display());
+    println!("• Unit:   {}", unit_path.display());
+    println!("→ Manage with: systemctl [status|restart|stop] {}", pkg_name);
+}
+
+fn uninstall_system_service(dry_run: bool) {
+    // Phase 1 (user): elevate, no empty headings.
+    if !is_root() {
+        println!("{C_GREEN}[INFO]{C_RESET} Elevating with sudo to uninstall system service…");
+        let mut args: Vec<String> = env::args().skip(1).collect();
+        if dry_run && !args.iter().any(|x| x == "--dry-run") {
+            args.push("--dry-run".to_string());
         }
+        elevate_privileges(&args);
     }
-    
-    let script = match name {
-        "install" => INSTALL_SCRIPT,
-        "uninstall" => UNINSTALL_SCRIPT,
-        _ => {
-            eprintln!("Unknown script: {}", name);
-            std::process::exit(1);
-        }
-    };
-    
-    // Create a temporary file for the script
-    let temp_dir = std::env::temp_dir();
-    let temp_file_path = temp_dir.join(format!("corky_{}_script.sh", name));
-    
-    // Write the script to the temp file
-    let mut file = File::create(&temp_file_path).expect("Failed to create temp file");
-    file.write_all(script.as_bytes()).expect("Failed to write script to temp file");
-    
-    // Make the script executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(&temp_file_path).expect("Failed to get file metadata");
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&temp_file_path, perms).expect("Failed to set file permissions");
-    }
-    
-    // Build the command - use bash to execute the script instead of executing directly
-    // This avoids the "Text file busy" error that can occur when trying to execute
-    // a file that was just written
-    let mut cmd = Command::new("bash");
-    cmd.arg(&temp_file_path);
-    
-    // Add dry-run flag if specified
+
+    // Phase 2 (root)
+    section("Uninstall (system service)");
+    let (pkg_name, _) =
+        pkg_name_and_description().unwrap_or_else(|| ("corky".to_string(), "corky service".to_string()));
+    let unit = format!("{}.service", &pkg_name);
+    let unit_path = Path::new(UNIT_DIR_SYSTEM).join(&unit);
+    let bin_path = Path::new(BIN_PATH_SYSTEM).join(&pkg_name);
+
+    // Stop & disable if present
+    section("Stopping & disabling");
     if dry_run {
-        cmd.arg("--dry-run");
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl stop {}", pkg_name);
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl disable {}", pkg_name);
+    } else {
+        // best-effort; we keep stdout/stderr inherited so the user sees real actions (like symlink removal)
+        let _ = run_cmd("systemctl", &["stop", &pkg_name]);
+        let _ = run_cmd("systemctl", &["disable", &pkg_name]);
     }
-    
-    // Execute the script through bash
-    let status = cmd
+
+    // Remove unit + reload; use quiet reset-failed so no confusing error text
+    section("Removing unit & reloading daemon");
+    if dry_run {
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would remove: {}", unit_path.display());
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl reset-failed {}", pkg_name);
+    } else {
+        if unit_path.exists() {
+            println!("{C_GREEN}[INFO]{C_RESET} Removing unit {}", unit_path.display());
+            if let Err(e) = fs::remove_file(&unit_path) {
+                eprintln!("{C_YELLOW}[WARN]{C_RESET} remove {}: {}", unit_path.display(), e);
+            }
+        } else {
+            println!("{C_YELLOW}[WARN]{C_RESET} Unit not found at {}", unit_path.display());
+        }
+        run_cmd_expect_ok("systemctl", &["daemon-reload"]);
+        // Quiet best-effort: suppress any “not loaded” noise
+        let _ = run_cmd_quiet("systemctl", &["reset-failed", &pkg_name]);
+    }
+
+    // Remove binary
+    section("Removing binary");
+    if dry_run {
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would remove: {}", bin_path.display());
+    } else {
+        if bin_path.exists() {
+            println!("{C_GREEN}[INFO]{C_RESET} Removing binary {}", bin_path.display());
+            if let Err(e) = fs::remove_file(&bin_path) {
+                eprintln!("{C_YELLOW}[WARN]{C_RESET} remove {}: {}", bin_path.display(), e);
+            }
+        } else {
+            println!("{C_YELLOW}[WARN]{C_RESET} Binary not found at {}", bin_path.display());
+        }
+    }
+
+    section("Done");
+    println!("{C_BGREEN}[SUCCESS]{C_RESET} {} uninstalled.", pkg_name);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+fn section(title: &str) {
+    println!("\n{C_BLUE}╔══════════════════════════════════════════════════════════╗{C_RESET}");
+    println!("{C_BLUE}║{C_RESET} {C_WHITE}{C_BOLD}{:<54}{C_RESET} {C_BLUE}║{C_RESET}", title);
+    println!("{C_BLUE}╚══════════════════════════════════════════════════════════╝{C_RESET}");
+}
+
+fn validate_corky_package_or_exit() {
+    let cargo_toml = Path::new("Cargo.toml");
+    if !cargo_toml.exists() {
+        eprintln!("{C_RED}[ERROR]{C_RESET} No Cargo.toml found in the current directory.");
+        std::process::exit(1);
+    }
+    let content = fs::read_to_string(cargo_toml).unwrap_or_default();
+    let ok = content.contains("[corky]") && content.contains("is_corky_package = true");
+    if !ok {
+        eprintln!("{C_RED}[ERROR]{C_RESET} This does not appear to be a Corky package.");
+        eprintln!("{C_WHITE}A Corky package must have [corky] with is_corky_package = true in Cargo.toml.{C_RESET}");
+        std::process::exit(1);
+    }
+}
+
+fn pkg_name_and_description() -> Option<(String, String)> {
+    let cargo_toml = Path::new("Cargo.toml");
+    let content = fs::read_to_string(cargo_toml).ok()?;
+    let mut in_package = false;
+    let mut name: Option<String> = None;
+    let mut desc: Option<String> = None;
+    for line in content.lines() {
+        let l = line.trim();
+        if l.starts_with("[package]") {
+            in_package = true;
+            continue;
+        }
+        if in_package && l.starts_with('[') && l.ends_with(']') && l != "[package]" {
+            break;
+        }
+        if in_package {
+            if name.is_none() && l.starts_with("name") {
+                if let Some(v) = extract_toml_str_value(l) {
+                    name = Some(v);
+                }
+            }
+            if desc.is_none() && l.starts_with("description") {
+                if let Some(v) = extract_toml_str_value(l) {
+                    desc = Some(v);
+                }
+            }
+        }
+    }
+    Some((
+        name.unwrap_or_else(|| "corky".to_string()),
+        desc.unwrap_or_else(|| "corky service".to_string()),
+    ))
+}
+
+fn extract_toml_str_value(line: &str) -> Option<String> {
+    let parts: Vec<&str> = line.splitn(2, '=').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let rhs = parts[1].trim();
+    if rhs.starts_with('"') && rhs.ends_with('"') && rhs.len() >= 2 {
+        return Some(rhs[1..rhs.len() - 1].to_string());
+    }
+    None
+}
+
+fn installing_user() -> String {
+    if is_root() {
+        if let Ok(sudo_user) = env::var("SUDO_USER") {
+            if !sudo_user.is_empty() {
+                return sudo_user;
+            }
+        }
+        "root".to_string()
+    } else {
+        env::var("USER").unwrap_or_else(|_| "user".to_string())
+    }
+}
+
+fn run_cmd(cmd: &str, args: &[&str]) -> bool {
+    let status = Command::new(cmd)
+        .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
-        .expect("Failed to execute script");
-    
-    // Cleanup the temp file
-    fs::remove_file(&temp_file_path).ok();
-    
-    // Exit with the same status as the script
-    std::process::exit(status.code().unwrap_or(1));
+        .status();
+    match status {
+        Ok(s) => s.success(),
+        Err(e) => {
+            eprintln!("{C_RED}[ERROR]{C_RESET} Failed to execute {} {:?}: {}", cmd, args, e);
+            false
+        }
+    }
 }
 
+/// Quiet best-effort command: swallows stdout/stderr and returns success flag.
+fn run_cmd_quiet(cmd: &str, args: &[&str]) -> bool {
+    let status = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
+fn run_cmd_expect_ok(cmd: &str, args: &[&str]) {
+    if !run_cmd(cmd, args) {
+        eprintln!("{C_RED}[ERROR]{C_RESET} Command failed: {} {:?}", cmd, args);
+        std::process::exit(1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// systemctl / journalctl helpers
+// ─────────────────────────────────────────────────────────────────────────────
 fn list_corky_services() -> Vec<(String, String)> {
     let mut services = Vec::new();
-    
-    // Check for user services
+
     if let Ok(output) = Command::new("systemctl")
         .args(["--user", "list-unit-files", "corky-*.service", "--no-legend"])
-        .output() {
+        .output()
+    {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
@@ -405,11 +616,11 @@ fn list_corky_services() -> Vec<(String, String)> {
             }
         }
     }
-    
-    // Check for system services
+
     if let Ok(output) = Command::new("systemctl")
         .args(["list-unit-files", "corky-*.service", "--no-legend"])
-        .output() {
+        .output()
+    {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
@@ -419,7 +630,7 @@ fn list_corky_services() -> Vec<(String, String)> {
             }
         }
     }
-    
+
     services
 }
 
@@ -436,9 +647,7 @@ fn parse_corky_service(line: &str, scope: &str) -> Option<(String, String)> {
     None
 }
 
-/// Resolve a service name from the provided ServiceName enum value
-/// This handles auto-selection, interactive selection, etc.
-// Service with its scope (system or user)
+/// Service with its scope (system or user)
 struct ServiceInfo {
     name: String,
     scope: String,
@@ -446,39 +655,33 @@ struct ServiceInfo {
 
 fn resolve_service(arg: Option<ServiceName>) -> ServiceInfo {
     let services = list_corky_services();
-    
+
     if services.is_empty() {
-        eprintln!("No Corky services found. You may need to install a service first.");
+        eprintln!("{C_RED}[ERROR]{C_RESET} No Corky services found. You may need to install a service first.");
         std::process::exit(1);
     }
-    
+
     let service_name = match arg {
         Some(ServiceName::Auto) => {
             if services.len() == 1 {
-                // Only one service, return it
                 services[0].0.clone()
             } else {
-                // Multiple services, need to prompt
-                eprintln!("Multiple services found. Please specify one:");
+                eprintln!("{C_YELLOW}[WARN]{C_RESET} Multiple services found. Please specify one:");
                 for (i, (service, scope)) in services.iter().enumerate() {
                     eprintln!("  {}. {} ({})", i + 1, service, scope);
                 }
                 std::process::exit(1);
             }
-        },
+        }
         Some(ServiceName::All) => {
-            eprintln!("Cannot perform this operation on all services.");
-            eprintln!("Please specify a single service name.");
+            eprintln!("{C_RED}[ERROR]{C_RESET} Cannot perform this operation on all services. Specify one.");
             std::process::exit(1);
-        },
+        }
         Some(ServiceName::Interactive) => {
-            // Use inquire crate for interactive selection
             if services.is_empty() {
-                eprintln!("No services found to select from.");
+                eprintln!("{C_RED}[ERROR]{C_RESET} No services to select from.");
                 std::process::exit(1);
             }
-            
-            // Format options with scope
             let options: Vec<String> = services
                 .iter()
                 .map(|(name, scope)| {
@@ -486,44 +689,39 @@ fn resolve_service(arg: Option<ServiceName>) -> ServiceInfo {
                     format!("{} ({})", display_name, scope)
                 })
                 .collect();
-            
-            // Clone options before moving them into the prompt
+
             match inquire::Select::new("Select a service:", options.clone()).prompt() {
                 Ok(selected) => {
-                    // Extract the service name from the selection (remove the scope part)
                     let index = options.iter().position(|o| o == &selected).unwrap();
                     services[index].0.clone()
-                },
+                }
                 Err(_) => {
-                    eprintln!("Service selection cancelled.");
+                    eprintln!("{C_YELLOW}[WARN]{C_RESET} Service selection cancelled.");
                     std::process::exit(1);
                 }
             }
-        },
+        }
         Some(ServiceName::Custom(name)) => {
-            // Check if this is an abbreviated name (e.g., "telegram" instead of "corky-telegram")
             let name_with_prefix = if !name.starts_with("corky-") {
                 format!("corky-{}", name)
             } else {
                 name
             };
-            
-            // Find matching service
+
             let matches: Vec<_> = services
                 .iter()
                 .filter(|(service, _)| service == &name_with_prefix)
                 .collect();
-            
+
             if matches.is_empty() {
-                eprintln!("No service found with name: {}", name_with_prefix);
+                eprintln!("{C_RED}[ERROR]{C_RESET} No service found with name: {}", name_with_prefix);
                 eprintln!("Available services:");
                 for (service, scope) in &services {
                     eprintln!("  {} ({})", service, scope);
                 }
                 std::process::exit(1);
             } else if matches.len() > 1 {
-                eprintln!("Multiple services match the name: {}", name_with_prefix);
-                eprintln!("Please specify which one:");
+                eprintln!("{C_YELLOW}[WARN]{C_RESET} Multiple services match: {}", name_with_prefix);
                 for (i, (service, scope)) in matches.iter().enumerate() {
                     eprintln!("  {}. {} ({})", i + 1, service, scope);
                 }
@@ -531,15 +729,11 @@ fn resolve_service(arg: Option<ServiceName>) -> ServiceInfo {
             } else {
                 matches[0].0.clone()
             }
-        },
+        }
         None => {
-            // Default to interactive selection
             if services.len() == 1 {
-                // Only one service, return it
                 services[0].0.clone()
             } else {
-                // Use inquire crate for interactive selection
-                // Format options with scope
                 let options: Vec<String> = services
                     .iter()
                     .map(|(name, scope)| {
@@ -547,60 +741,47 @@ fn resolve_service(arg: Option<ServiceName>) -> ServiceInfo {
                         format!("{} ({})", display_name, scope)
                     })
                     .collect();
-                
-                // Clone options before moving them into the prompt
+
                 match inquire::Select::new("Select a service:", options.clone()).prompt() {
                     Ok(selected) => {
-                        // Extract the service name from the selection
                         let index = options.iter().position(|o| o == &selected).unwrap();
                         services[index].0.clone()
-                    },
+                    }
                     Err(_) => {
-                        eprintln!("Service selection cancelled.");
+                        eprintln!("{C_YELLOW}[WARN]{C_RESET} Service selection cancelled.");
                         std::process::exit(1);
                     }
                 }
             }
         }
     };
-    
-    // Find the scope for the selected service
+
     let scope = services
         .iter()
         .find(|(name, _)| name == &service_name)
         .map(|(_, scope)| scope.clone())
         .unwrap_or_else(|| "system".to_string());
-    
-    ServiceInfo {
-        name: service_name,
-        scope,
-    }
+
+    ServiceInfo { name: service_name, scope }
 }
 
 fn run_systemctl(action: &str, service_info: &ServiceInfo) {
-    // Check if we need root privileges for system services
     if service_info.scope == "system" && !is_root() {
-        println!("This operation requires root privileges to manage system services.");
-        
-        // Get the original command line arguments
-        let args: Vec<String> = env::args().collect();
-        
-        // Re-execute with sudo
-        elevate_privileges(&args[1..]);
+        ensure_sudo_timestamp();
+        let args: Vec<String> = env::args().skip(1).collect();
+        elevate_privileges(&args);
     }
-    
+
     let mut cmd = Command::new("systemctl");
-    
-    // Add --user flag for user services
     if service_info.scope == "user" {
         cmd.arg("--user");
     }
-    
-    println!("Running: systemctl {} {}.service", 
-             action,
-             service_info.name);
 
-    // For status command, we use inherit to show the rich formatted output
+    println!(
+        "{C_GREEN}[INFO]{C_RESET} Running: systemctl {} {}.service",
+        action, service_info.name
+    );
+
     if action == "status" {
         let status = cmd
             .arg(action)
@@ -610,72 +791,56 @@ fn run_systemctl(action: &str, service_info: &ServiceInfo) {
             .stderr(Stdio::inherit())
             .status()
             .expect("Failed to run systemctl");
-            
+
         std::process::exit(status.code().unwrap_or(1));
     } else {
-        // For other commands, capture output and display it
-        match cmd
-            .arg(action)
-            .arg(format!("{}.service", service_info.name))
-            .output() {
-                Ok(output) => {
-                    let exit_code = output.status.code().unwrap_or(1);
-                    
-                    // Display stdout if not empty
-                    if !output.stdout.is_empty() {
-                        println!("{}", String::from_utf8_lossy(&output.stdout));
-                    }
-                    
-                    // Display stderr if not empty
-                    if !output.stderr.is_empty() {
-                        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-                    }
-                    
-                    // Provide feedback based on exit code
-                    if exit_code == 0 {
-                        let action_past = match action {
-                            "start" => "started",
-                            "stop" => "stopped",
-                            "restart" => "restarted",
-                            "enable" => "enabled",
-                            "disable" => "disabled",
-                            _ => "processed"
-                        };
-                        println!("Service {} successfully {}.", service_info.name, action_past);
-                    } else {
-                        eprintln!("Failed to {} service {}. Exit code: {}", 
-                                 action, service_info.name, exit_code);
-                    }
-                    
-                    std::process::exit(exit_code);
-                },
-                Err(e) => {
-                    eprintln!("Failed to execute systemctl: {}", e);
-                    std::process::exit(1);
+        match cmd.arg(action).arg(format!("{}.service", service_info.name)).output() {
+            Ok(output) => {
+                let exit_code = output.status.code().unwrap_or(1);
+                if !output.stdout.is_empty() {
+                    println!("{}", String::from_utf8_lossy(&output.stdout));
                 }
+                if !output.stderr.is_empty() {
+                    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+                if exit_code == 0 {
+                    let action_past = match action {
+                        "start" => "started",
+                        "stop" => "stopped",
+                        "restart" => "restarted",
+                        "enable" => "enabled",
+                        "disable" => "disabled",
+                        _ => "processed",
+                    };
+                    println!("{C_BGREEN}[OK]{C_RESET} Service {} {}", service_info.name, action_past);
+                } else {
+                    eprintln!(
+                        "{C_RED}[ERROR]{C_RESET} Failed to {} service {}. Exit code: {}",
+                        action, service_info.name, exit_code
+                    );
+                }
+                std::process::exit(exit_code);
             }
+            Err(e) => {
+                eprintln!("{C_RED}[ERROR]{C_RESET} Failed to execute systemctl: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
 fn run_systemctl_logs(service_info: &ServiceInfo) {
-    // Check if we need root privileges for system services
     if service_info.scope == "system" && !is_root() {
-        println!("This operation requires root privileges to view system service logs.");
-        
-        // Get the original command line arguments
-        let args: Vec<String> = env::args().collect();
-        
-        // Re-execute with sudo
-        elevate_privileges(&args[1..]);
+        ensure_sudo_timestamp();
+        let args: Vec<String> = env::args().skip(1).collect();
+        elevate_privileges(&args);
     }
-    
+
     let mut cmd = Command::new("journalctl");
-    
-    // Add --user flag for user services
     if service_info.scope == "user" {
         cmd.arg("--user");
     }
-    
+
     let status = cmd
         .arg("-u")
         .arg(format!("{}.service", service_info.name))
@@ -685,35 +850,32 @@ fn run_systemctl_logs(service_info: &ServiceInfo) {
         .stderr(Stdio::inherit())
         .status()
         .expect("Failed to run journalctl");
-        
+
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Generate shell completion script for corky
 fn generate_completion(shell: Shell) {
     let mut cmd = Cli::command();
     let bin_name = cmd.get_name().to_string();
 
-    // Print completion script to stdout
     generate(shell, &mut cmd, bin_name, &mut io::stdout());
 
-    // Print installation instructions
     eprintln!("\nTo use these completions:");
     match shell {
         Shell::Bash => {
             eprintln!("Add the above to ~/.bash_completion or source it from your ~/.bashrc");
             eprintln!("Example: corky completion bash > ~/.bash_completion.d/corky");
-        },
+        }
         Shell::Zsh => {
             eprintln!("Save the above to _corky in your fpath directory");
             eprintln!("Example: corky completion zsh > ~/.zsh/completions/_corky");
-        },
+        }
         Shell::Fish => {
             eprintln!("Save the above to ~/.config/fish/completions/corky.fish");
             eprintln!("Example: corky completion fish > ~/.config/fish/completions/corky.fish");
-        },
+        }
         _ => {
             eprintln!("Follow your shell's documentation for installing completion scripts");
-        },
+        }
     }
 }
