@@ -1,5 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Generator, Shell};
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -145,38 +146,132 @@ impl std::fmt::Display for ServiceName {
     }
 }
 
+/// Check if the current process is running with root privileges
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false // On non-unix platforms, assume not root
+    }
+}
+
+/// Restart the current process with elevated privileges
+fn elevate_privileges(args: &[String]) -> ! {
+    println!("{}", "This operation requires root privileges.");
+    
+    // Construct the command to run with sudo
+    let status = Command::new("sudo")
+        .arg(env::current_exe().expect("Failed to get current executable path"))
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("Failed to execute sudo command");
+    
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Determine if the given command requires root privileges
+fn requires_root(command: &Commands) -> bool {
+    match command {
+        Commands::Install { .. } => true,
+        Commands::Uninstall { .. } => true,
+        Commands::Start { service } => {
+            // Only require root for system services
+            if let Some(service_name) = service {
+                if matches!(service_name, ServiceName::All) {
+                    return true; // All includes system services
+                }
+            }
+            // We'll check more specifically in run_systemctl
+            false
+        },
+        Commands::Stop { service } => {
+            if let Some(service_name) = service {
+                if matches!(service_name, ServiceName::All) {
+                    return true;
+                }
+            }
+            false
+        },
+        Commands::Restart { service } => {
+            if let Some(service_name) = service {
+                if matches!(service_name, ServiceName::All) {
+                    return true;
+                }
+            }
+            false
+        },
+        Commands::Enable { service } => {
+            if let Some(service_name) = service {
+                if matches!(service_name, ServiceName::All) {
+                    return true;
+                }
+            }
+            false
+        },
+        Commands::Disable { service } => {
+            if let Some(service_name) = service {
+                if matches!(service_name, ServiceName::All) {
+                    return true;
+                }
+            }
+            false
+        },
+        // These commands don't modify system state, so they don't need root
+        Commands::Logs { .. } => false,
+        Commands::Status { .. } => false,
+        Commands::List => false,
+        Commands::Completion { .. } => false,
+        Commands::CompletionItems { .. } => false,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     
-    match cli.command {
-        Commands::Install { dry_run } => run_embedded_script("install", dry_run),
-        Commands::Uninstall { dry_run } => run_embedded_script("uninstall", dry_run),
+    // Check if we need root privileges for this command
+    if requires_root(&cli.command) && !is_root() {
+        // Get the original command line arguments
+        let args: Vec<String> = env::args().collect();
+        
+        // Re-execute with sudo
+        elevate_privileges(&args[1..]);
+    }
+    
+    match &cli.command {
+        Commands::Install { dry_run } => run_embedded_script("install", *dry_run),
+        Commands::Uninstall { dry_run } => run_embedded_script("uninstall", *dry_run),
         Commands::Logs { service } => {
-            let service_info = resolve_service(service);
+            let service_info = resolve_service(service.clone());
             run_systemctl_logs(&service_info);
         }
         Commands::Status { service } => {
-            let service_info = resolve_service(service);
+            let service_info = resolve_service(service.clone());
             run_systemctl("status", &service_info);
         }
         Commands::Start { service } => {
-            let service_info = resolve_service(service);
+            let service_info = resolve_service(service.clone());
             run_systemctl("start", &service_info);
         }
         Commands::Stop { service } => {
-            let service_info = resolve_service(service);
+            let service_info = resolve_service(service.clone());
             run_systemctl("stop", &service_info);
         }
         Commands::Restart { service } => {
-            let service_info = resolve_service(service);
+            let service_info = resolve_service(service.clone());
             run_systemctl("restart", &service_info);
         }
         Commands::Enable { service } => {
-            let service_info = resolve_service(service);
+            let service_info = resolve_service(service.clone());
             run_systemctl("enable", &service_info);
         }
         Commands::Disable { service } => {
-            let service_info = resolve_service(service);
+            let service_info = resolve_service(service.clone());
             run_systemctl("disable", &service_info);
         }
         Commands::List => {
@@ -187,7 +282,7 @@ fn main() {
             }
         }
         Commands::Completion { shell } => {
-            generate_completion(shell);
+            generate_completion(*shell);
         }
         Commands::CompletionItems { cmd: _ } => {
             // List available service names for tab completion
@@ -206,6 +301,17 @@ const UNINSTALL_SCRIPT: &str = include_str!("../cmds/uninstall.sh");
 
 /// Writes embedded script to a temp file and executes it from PWD
 fn run_embedded_script(name: &str, dry_run: bool) {
+    // Check for root privileges for install/uninstall operations
+    if !is_root() {
+        println!("This operation requires root privileges.");
+        
+        // Get the original command line arguments
+        let args: Vec<String> = env::args().collect();
+        
+        // Re-execute with sudo
+        elevate_privileges(&args[1..]);
+    }
+    
     // Check for Cargo.toml before executing
     let cargo_path = std::path::Path::new("Cargo.toml");
     if !cargo_path.exists() {
@@ -472,6 +578,17 @@ fn resolve_service(arg: Option<ServiceName>) -> ServiceInfo {
 }
 
 fn run_systemctl(action: &str, service_info: &ServiceInfo) {
+    // Check if we need root privileges for system services
+    if service_info.scope == "system" && !is_root() {
+        println!("This operation requires root privileges to manage system services.");
+        
+        // Get the original command line arguments
+        let args: Vec<String> = env::args().collect();
+        
+        // Re-execute with sudo
+        elevate_privileges(&args[1..]);
+    }
+    
     let mut cmd = Command::new("systemctl");
     
     // Add --user flag for user services
@@ -479,11 +596,10 @@ fn run_systemctl(action: &str, service_info: &ServiceInfo) {
         cmd.arg("--user");
     }
     
-    println!("Running: systemctl {} {} ({} service)", 
-             if service_info.scope == "user" { "--user" } else { "" },
+    println!("Running: systemctl {} {}.service", 
              action,
-             if service_info.scope == "user" { "user " } else { "system " });
-    
+             service_info.name);
+
     // For status command, we use inherit to show the rich formatted output
     if action == "status" {
         let status = cmd
@@ -542,6 +658,17 @@ fn run_systemctl(action: &str, service_info: &ServiceInfo) {
 }
 
 fn run_systemctl_logs(service_info: &ServiceInfo) {
+    // Check if we need root privileges for system services
+    if service_info.scope == "system" && !is_root() {
+        println!("This operation requires root privileges to view system service logs.");
+        
+        // Get the original command line arguments
+        let args: Vec<String> = env::args().collect();
+        
+        // Re-execute with sudo
+        elevate_privileges(&args[1..]);
+    }
+    
     let mut cmd = Command::new("journalctl");
     
     // Add --user flag for user services
