@@ -1,5 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::io;
@@ -33,6 +34,8 @@ const BANNER: &str = r#"
 // ─────────────────────────────────────────────────────────────────────────────
 const SUDO_BIN: &str = "sudo";
 const ENV_ELEVATED_FLAG: &str = "CORKY_ELEVATED"; // prevents re-entrancy loops
+const ENV_BINARY_CHECKSUM: &str = "CORKY_BINARY_CHECKSUM"; // for TOCTOU protection
+const ENV_ORIGINAL_CWD: &str = "CORKY_ORIGINAL_CWD"; // preserve cwd across sudo
 const BIN_PATH_SYSTEM: &str = "/usr/local/bin";
 const UNIT_DIR_SYSTEM: &str = "/etc/systemd/system";
 
@@ -45,6 +48,45 @@ const C_YELLOW: &str = "\x1b[33m";
 const C_BLUE: &str = "\x1b[34m";
 const C_WHITE: &str = "\x1b[37m";
 const C_CYAN: &str = "\x1b[36m";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOML structures for Cargo.toml parsing
+// ─────────────────────────────────────────────────────────────────────────────
+#[derive(Deserialize)]
+struct CargoToml {
+    package: Option<Package>,
+    corky: Option<CorkyConfig>,
+}
+
+#[derive(Deserialize)]
+struct Package {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CorkyConfig {
+    is_corky_package: Option<bool>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Small helper functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Print an error message and exit with status 1.
+fn exit_error(msg: &str) -> ! {
+    eprintln!("{C_RED}[ERROR]{C_RESET} {}", msg);
+    std::process::exit(1);
+}
+
+/// Ensure service name has the corky- prefix.
+fn ensure_corky_prefix(name: &str) -> String {
+    if name.starts_with("corky-") {
+        name.to_string()
+    } else {
+        format!("corky-{}", name)
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI
@@ -117,10 +159,7 @@ enum Commands {
     },
     /// Print tab completion for shell - used internally by completion scripts
     #[command(hide = true)]
-    CompletionItems {
-        /// Command to complete (logs, status, etc.)
-        cmd: String,
-    },
+    CompletionItems,
 }
 
 /// Service name specification - can be a special value or a custom service name
@@ -139,9 +178,24 @@ impl std::str::FromStr for ServiceName {
             "auto" => Ok(ServiceName::Auto),
             "all" => Ok(ServiceName::All),
             "interactive" => Ok(ServiceName::Interactive),
-            _ => Ok(ServiceName::Custom(s.to_string())),
+            _ => {
+                // Validate service name: only alphanumeric, underscore, and hyphen allowed
+                if !is_valid_service_name(s) {
+                    return Err(format!(
+                        "Invalid service name '{}'. Only alphanumeric characters, underscores, and hyphens are allowed.",
+                        s
+                    ));
+                }
+                Ok(ServiceName::Custom(s.to_string()))
+            }
         }
     }
+}
+
+/// Validate that a service name contains only safe characters.
+/// Allowed: alphanumeric, underscore (_), hyphen (-)
+fn is_valid_service_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 impl std::fmt::Display for ServiceName {
@@ -184,18 +238,33 @@ fn ensure_sudo_timestamp() {
 
 /// Restart the current process with elevated privileges (re-exec via sudo).
 /// Uses an env flag to avoid recursion loops if the elevated run calls this again.
-fn elevate_privileges(args: &[String]) -> ! {
+/// Accepts additional environment variables to pass through sudo.
+fn elevate_privileges(args: &[String], extra_env: &[(&str, &str)]) -> ! {
     if env::var_os(ENV_ELEVATED_FLAG).is_some() {
         eprintln!("{C_RED}Elevation loop detected; aborting.{C_RESET}");
         std::process::exit(1);
     }
     ensure_sudo_timestamp();
     let exe = env::current_exe().expect("Failed to get current executable path");
+
+    // Capture cwd before sudo changes it
     let cwd = env::current_dir().ok();
+    let cwd_str = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
 
     let mut cmd = Command::new(SUDO_BIN);
-    cmd.env(ENV_ELEVATED_FLAG, "1")
-        .arg(exe)
+    cmd.env(ENV_ELEVATED_FLAG, "1");
+
+    // Pass original working directory through env var
+    if let Some(ref dir) = cwd_str {
+        cmd.env(ENV_ORIGINAL_CWD, dir);
+    }
+
+    // Pass any additional environment variables
+    for (key, value) in extra_env {
+        cmd.env(*key, *value);
+    }
+
+    cmd.arg(exe)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -248,17 +317,16 @@ fn main() {
         }
         Commands::List => {
             println!("{}Available Corky Services:{}\n-------------------------", C_BOLD, C_RESET);
-            for (service, scope) in list_corky_services() {
-                println!("  {} ({})", service, scope);
+            for s in list_corky_services() {
+                println!("  {} ({})", s.name, s.scope);
             }
         }
         Commands::Completion { shell } => {
             generate_completion(*shell);
         }
-        Commands::CompletionItems { cmd: _ } => {
-                for (service, _) in list_corky_services() {
-                let service_name = service.replace("corky-", "");
-                println!("{}", service_name);
+        Commands::CompletionItems => {
+            for s in list_corky_services() {
+                println!("{}", s.name.replace("corky-", ""));
             }
         }
     }
@@ -294,25 +362,66 @@ fn install_system_service(dry_run: bool) {
             }
         }
 
+        // Compute checksum of built binary for TOCTOU protection
+        let (raw_pkg_name, _) = pkg_name_and_description().unwrap_or_else(|| {
+            ("corky".to_string(), "corky service".to_string())
+        });
+        let target_bin = Path::new("target").join("release").join(&raw_pkg_name);
+        let checksum = if !dry_run {
+            compute_file_checksum(&target_bin).unwrap_or_else(|| {
+                eprintln!("{C_RED}[ERROR]{C_RESET} Failed to compute checksum of {}", target_bin.display());
+                std::process::exit(1);
+            })
+        } else {
+            String::new()
+        };
+
         // Single, informative line instead of an empty heading
         println!("{C_GREEN}[INFO]{C_RESET} Elevating with sudo to install system service…");
-        let mut args: Vec<String> = env::args().skip(1).collect();
-        if dry_run && !args.iter().any(|x| x == "--dry-run") {
-            args.push("--dry-run".to_string());
-        }
-        elevate_privileges(&args);
+        let args: Vec<String> = env::args().skip(1).collect();
+        elevate_privileges(&args, &[(ENV_BINARY_CHECKSUM, &checksum)]);
     }
 
     // Phase 2 (root): install only — no duplicate validation/build sections
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let (pkg_name, description) = pkg_name_and_description().unwrap_or_else(|| {
+    // Use preserved working directory from before sudo elevation
+    let cwd = env::var(ENV_ORIGINAL_CWD)
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+
+    // Change to the original directory if different
+    if let Err(e) = env::set_current_dir(&cwd) {
+        eprintln!("{C_YELLOW}[WARN]{C_RESET} Could not change to original directory {}: {}", cwd.display(), e);
+    }
+
+    let (raw_pkg_name, description) = pkg_name_and_description().unwrap_or_else(|| {
         eprintln!("{C_YELLOW}[WARN]{C_RESET} Using fallback metadata (could not read Cargo.toml).");
         ("corky".to_string(), "corky service".to_string())
     });
 
-    let target_bin = Path::new("target").join("release").join(&pkg_name);
-    let install_bin = Path::new(BIN_PATH_SYSTEM).join(&pkg_name);
-    let unit_path = Path::new(UNIT_DIR_SYSTEM).join(format!("{}.service", &pkg_name));
+    // Ensure service name has corky- prefix for discovery by list_corky_services()
+    let service_name = ensure_corky_prefix(&raw_pkg_name);
+
+    let target_bin = Path::new("target").join("release").join(&raw_pkg_name);
+    let install_bin = Path::new(BIN_PATH_SYSTEM).join(&raw_pkg_name);
+    let unit_path = Path::new(UNIT_DIR_SYSTEM).join(format!("{}.service", &service_name));
+
+    // Verify binary integrity (TOCTOU protection)
+    if !dry_run {
+        if let Ok(expected_checksum) = env::var(ENV_BINARY_CHECKSUM) {
+            if !expected_checksum.is_empty() {
+                let actual_checksum = compute_file_checksum(&target_bin).unwrap_or_default();
+                if actual_checksum != expected_checksum {
+                    eprintln!("{C_RED}[ERROR]{C_RESET} Binary checksum mismatch! The binary may have been tampered with.");
+                    eprintln!("Expected: {}", expected_checksum);
+                    eprintln!("Actual:   {}", actual_checksum);
+                    eprintln!("Please rebuild and try again.");
+                    std::process::exit(1);
+                }
+                println!("{C_GREEN}[INFO]{C_RESET} Binary integrity verified.");
+            }
+        }
+    }
 
     section("Installing binary");
     if dry_run {
@@ -349,7 +458,13 @@ fn install_system_service(dry_run: bool) {
     }
 
     section("Writing systemd unit");
-    let working_dir = if cwd.is_dir() { cwd } else { PathBuf::from("/") };
+    if !cwd.is_dir() {
+        eprintln!("{C_RED}[ERROR]{C_RESET} Working directory does not exist: {}", cwd.display());
+        eprintln!("Please run this command from a valid directory.");
+        std::process::exit(1);
+    }
+    let user = installing_user();
+    let group = primary_group_for_user(&user);
     let unit_contents = format!(
         r#"[Unit]
 Description={description}
@@ -358,7 +473,7 @@ After=network-online.target
 
 [Service]
 User={user}
-Group={user}
+Group={group}
 WorkingDirectory={workdir}
 ExecStart={exec_path}
 ExecStartPre=/usr/bin/test -x {exec_path}
@@ -370,8 +485,9 @@ ProtectHome=no
 WantedBy=multi-user.target
 "#,
         description = description,
-        user = installing_user(),
-        workdir = working_dir.display(),
+        user = user,
+        group = group,
+        workdir = cwd.display(),
         exec_path = install_bin.display(),
     );
 
@@ -392,53 +508,59 @@ WantedBy=multi-user.target
     section("Reloading & enabling service");
     if dry_run {
         println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl enable {}", pkg_name);
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl start {}", pkg_name);
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl enable {}", service_name);
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl start {}", service_name);
         return;
     }
     run_cmd_expect_ok("systemctl", &["daemon-reload"]);
-    run_cmd_expect_ok("systemctl", &["enable", &pkg_name]);
-    let ok = run_cmd("systemctl", &["start", &pkg_name]);
+    run_cmd_expect_ok("systemctl", &["enable", &service_name]);
+    let ok = run_cmd("systemctl", &["start", &service_name]);
     if !ok {
-        eprintln!("{C_RED}[ERROR]{C_RESET} Failed to start service. Try: systemctl status {}", pkg_name);
+        eprintln!("{C_RED}[ERROR]{C_RESET} Failed to start service. Try: systemctl status {}", service_name);
         std::process::exit(1);
     }
 
     section("Done");
-    println!("{C_BGREEN}[SUCCESS]{C_RESET} {} installed and started.", pkg_name);
+    println!("{C_BGREEN}[SUCCESS]{C_RESET} {} installed and started.", service_name);
     println!("• Binary: {}", install_bin.display());
     println!("• Unit:   {}", unit_path.display());
-    println!("→ Manage with: systemctl [status|restart|stop] {}", pkg_name);
+    println!("→ Manage with: systemctl [status|restart|stop] {}", service_name);
 }
 
 fn uninstall_system_service(dry_run: bool) {
     // Phase 1 (user): elevate, no empty headings.
     if !is_root() {
         println!("{C_GREEN}[INFO]{C_RESET} Elevating with sudo to uninstall system service…");
-        let mut args: Vec<String> = env::args().skip(1).collect();
-        if dry_run && !args.iter().any(|x| x == "--dry-run") {
-            args.push("--dry-run".to_string());
-        }
-        elevate_privileges(&args);
+        let args: Vec<String> = env::args().skip(1).collect();
+        elevate_privileges(&args, &[]);
     }
 
     // Phase 2 (root)
+    // Use preserved working directory from before sudo elevation
+    if let Ok(original_cwd) = env::var(ENV_ORIGINAL_CWD) {
+        let _ = env::set_current_dir(&original_cwd);
+    }
+
     section("Uninstall (system service)");
-    let (pkg_name, _) =
+    let (raw_pkg_name, _) =
         pkg_name_and_description().unwrap_or_else(|| ("corky".to_string(), "corky service".to_string()));
-    let unit = format!("{}.service", &pkg_name);
+
+    // Ensure service name has corky- prefix (matching install behavior)
+    let service_name = ensure_corky_prefix(&raw_pkg_name);
+
+    let unit = format!("{}.service", &service_name);
     let unit_path = Path::new(UNIT_DIR_SYSTEM).join(&unit);
-    let bin_path = Path::new(BIN_PATH_SYSTEM).join(&pkg_name);
+    let bin_path = Path::new(BIN_PATH_SYSTEM).join(&raw_pkg_name);
 
     // Stop & disable if present
     section("Stopping & disabling");
     if dry_run {
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl stop {}", pkg_name);
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl disable {}", pkg_name);
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl stop {}", service_name);
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl disable {}", service_name);
     } else {
         // best-effort; we keep stdout/stderr inherited so the user sees real actions (like symlink removal)
-        let _ = run_cmd("systemctl", &["stop", &pkg_name]);
-        let _ = run_cmd("systemctl", &["disable", &pkg_name]);
+        let _ = run_cmd("systemctl", &["stop", &service_name]);
+        let _ = run_cmd("systemctl", &["disable", &service_name]);
     }
 
     // Remove unit + reload; use quiet reset-failed so no confusing error text
@@ -446,7 +568,7 @@ fn uninstall_system_service(dry_run: bool) {
     if dry_run {
         println!("{C_CYAN}[DRY-RUN]{C_RESET} Would remove: {}", unit_path.display());
         println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl reset-failed {}", pkg_name);
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl reset-failed {}", service_name);
     } else {
         if unit_path.exists() {
             println!("{C_GREEN}[INFO]{C_RESET} Removing unit {}", unit_path.display());
@@ -457,27 +579,25 @@ fn uninstall_system_service(dry_run: bool) {
             println!("{C_YELLOW}[WARN]{C_RESET} Unit not found at {}", unit_path.display());
         }
         run_cmd_expect_ok("systemctl", &["daemon-reload"]);
-        // Quiet best-effort: suppress any “not loaded” noise
-        let _ = run_cmd_quiet("systemctl", &["reset-failed", &pkg_name]);
+        // Quiet best-effort: suppress any "not loaded" noise
+        let _ = run_cmd_quiet("systemctl", &["reset-failed", &service_name]);
     }
 
     // Remove binary
     section("Removing binary");
     if dry_run {
         println!("{C_CYAN}[DRY-RUN]{C_RESET} Would remove: {}", bin_path.display());
-    } else {
-        if bin_path.exists() {
-            println!("{C_GREEN}[INFO]{C_RESET} Removing binary {}", bin_path.display());
-            if let Err(e) = fs::remove_file(&bin_path) {
-                eprintln!("{C_YELLOW}[WARN]{C_RESET} remove {}: {}", bin_path.display(), e);
-            }
-        } else {
-            println!("{C_YELLOW}[WARN]{C_RESET} Binary not found at {}", bin_path.display());
+    } else if bin_path.exists() {
+        println!("{C_GREEN}[INFO]{C_RESET} Removing binary {}", bin_path.display());
+        if let Err(e) = fs::remove_file(&bin_path) {
+            eprintln!("{C_YELLOW}[WARN]{C_RESET} remove {}: {}", bin_path.display(), e);
         }
+    } else {
+        println!("{C_YELLOW}[WARN]{C_RESET} Binary not found at {}", bin_path.display());
     }
 
     section("Done");
-    println!("{C_BGREEN}[SUCCESS]{C_RESET} {} uninstalled.", pkg_name);
+    println!("{C_BGREEN}[SUCCESS]{C_RESET} {} uninstalled.", service_name);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -492,12 +612,25 @@ fn section(title: &str) {
 fn validate_corky_package_or_exit() {
     let cargo_toml = Path::new("Cargo.toml");
     if !cargo_toml.exists() {
-        eprintln!("{C_RED}[ERROR]{C_RESET} No Cargo.toml found in the current directory.");
-        std::process::exit(1);
+        exit_error("No Cargo.toml found in the current directory.");
     }
-    let content = fs::read_to_string(cargo_toml).unwrap_or_default();
-    let ok = content.contains("[corky]") && content.contains("is_corky_package = true");
-    if !ok {
+
+    let content = match fs::read_to_string(cargo_toml) {
+        Ok(c) => c,
+        Err(e) => exit_error(&format!("Failed to read Cargo.toml: {}", e)),
+    };
+
+    let parsed: CargoToml = match toml::from_str(&content) {
+        Ok(p) => p,
+        Err(e) => exit_error(&format!("Failed to parse Cargo.toml: {}", e)),
+    };
+
+    let is_corky = parsed
+        .corky
+        .and_then(|c| c.is_corky_package)
+        .unwrap_or(false);
+
+    if !is_corky {
         eprintln!("{C_RED}[ERROR]{C_RESET} This does not appear to be a Corky package.");
         eprintln!("{C_WHITE}A Corky package must have [corky] with is_corky_package = true in Cargo.toml.{C_RESET}");
         std::process::exit(1);
@@ -507,47 +640,21 @@ fn validate_corky_package_or_exit() {
 fn pkg_name_and_description() -> Option<(String, String)> {
     let cargo_toml = Path::new("Cargo.toml");
     let content = fs::read_to_string(cargo_toml).ok()?;
-    let mut in_package = false;
-    let mut name: Option<String> = None;
-    let mut desc: Option<String> = None;
-    for line in content.lines() {
-        let l = line.trim();
-        if l.starts_with("[package]") {
-            in_package = true;
-            continue;
-        }
-        if in_package && l.starts_with('[') && l.ends_with(']') && l != "[package]" {
-            break;
-        }
-        if in_package {
-            if name.is_none() && l.starts_with("name") {
-                if let Some(v) = extract_toml_str_value(l) {
-                    name = Some(v);
-                }
-            }
-            if desc.is_none() && l.starts_with("description") {
-                if let Some(v) = extract_toml_str_value(l) {
-                    desc = Some(v);
-                }
-            }
-        }
-    }
-    Some((
-        name.unwrap_or_else(|| "corky".to_string()),
-        desc.unwrap_or_else(|| "corky service".to_string()),
-    ))
-}
+    let parsed: CargoToml = toml::from_str(&content).ok()?;
 
-fn extract_toml_str_value(line: &str) -> Option<String> {
-    let parts: Vec<&str> = line.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let rhs = parts[1].trim();
-    if rhs.starts_with('"') && rhs.ends_with('"') && rhs.len() >= 2 {
-        return Some(rhs[1..rhs.len() - 1].to_string());
-    }
-    None
+    let name = parsed
+        .package
+        .as_ref()
+        .and_then(|p| p.name.clone())
+        .unwrap_or_else(|| "corky".to_string());
+
+    let description = parsed
+        .package
+        .as_ref()
+        .and_then(|p| p.description.clone())
+        .unwrap_or_else(|| "corky service".to_string());
+
+    Some((name, description))
 }
 
 fn installing_user() -> String {
@@ -561,6 +668,25 @@ fn installing_user() -> String {
     } else {
         env::var("USER").unwrap_or_else(|_| "user".to_string())
     }
+}
+
+/// Look up the primary group for a given user.
+/// Returns the group name, falling back to the username if lookup fails.
+fn primary_group_for_user(username: &str) -> String {
+    // Try using `id -gn <username>` to get the primary group name
+    if let Ok(output) = Command::new("id")
+        .args(["-gn", username])
+        .output()
+    {
+        if output.status.success() {
+            let group = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !group.is_empty() {
+                return group;
+            }
+        }
+    }
+    // Fallback to username (common case where username == groupname)
+    username.to_string()
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> bool {
@@ -597,10 +723,27 @@ fn run_cmd_expect_ok(cmd: &str, args: &[&str]) {
     }
 }
 
+/// Compute a simple checksum (XOR-based hash) of a file for TOCTOU protection.
+/// Not cryptographically secure, but sufficient to detect tampering between build and install.
+fn compute_file_checksum(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    // Simple checksum: length + XOR of all bytes in chunks
+    let len = data.len();
+    let mut xor_sum: u64 = 0;
+    for chunk in data.chunks(8) {
+        let mut val: u64 = 0;
+        for (i, &byte) in chunk.iter().enumerate() {
+            val |= (byte as u64) << (i * 8);
+        }
+        xor_sum ^= val;
+    }
+    Some(format!("{:016x}{:016x}", len, xor_sum))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // systemctl / journalctl helpers
 // ─────────────────────────────────────────────────────────────────────────────
-fn list_corky_services() -> Vec<(String, String)> {
+fn list_corky_services() -> Vec<ServiceInfo> {
     let mut services = Vec::new();
 
     if let Ok(output) = Command::new("systemctl")
@@ -610,8 +753,8 @@ fn list_corky_services() -> Vec<(String, String)> {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                if let Some(service_info) = parse_corky_service(line, "user") {
-                    services.push(service_info);
+                if let Some(info) = parse_corky_service(line, "user") {
+                    services.push(info);
                 }
             }
         }
@@ -624,8 +767,8 @@ fn list_corky_services() -> Vec<(String, String)> {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                if let Some(service_info) = parse_corky_service(line, "system") {
-                    services.push(service_info);
+                if let Some(info) = parse_corky_service(line, "system") {
+                    services.push(info);
                 }
             }
         }
@@ -635,142 +778,116 @@ fn list_corky_services() -> Vec<(String, String)> {
 }
 
 /// Parse corky-* services and label with "user" or "system"
-fn parse_corky_service(line: &str, scope: &str) -> Option<(String, String)> {
+fn parse_corky_service(line: &str, scope: &str) -> Option<ServiceInfo> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if !parts.is_empty() {
         let first_part = parts[0];
         if first_part.starts_with("corky-") && first_part.ends_with(".service") {
-            let service_name = first_part.trim_end_matches(".service").to_string();
-            return Some((service_name, scope.to_string()));
+            let name = first_part.trim_end_matches(".service").to_string();
+            return Some(ServiceInfo { name, scope: scope.to_string() });
         }
     }
     None
 }
 
 /// Service with its scope (system or user)
+#[derive(Clone)]
 struct ServiceInfo {
     name: String,
     scope: String,
+}
+
+/// Interactive prompt to select a service from a list.
+fn interactive_select_service(services: &[ServiceInfo]) -> ServiceInfo {
+    let options: Vec<String> = services
+        .iter()
+        .map(|s| format!("{} ({})", s.name.replace("corky-", ""), s.scope))
+        .collect();
+
+    match inquire::Select::new("Select a service:", options.clone()).prompt() {
+        Ok(selected) => {
+            let index = options.iter().position(|o| o == &selected)
+                .expect("selected option must exist");
+            services[index].clone()
+        }
+        Err(_) => {
+            eprintln!("{C_YELLOW}[WARN]{C_RESET} Service selection cancelled.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Elevate privileges if dealing with a system service.
+fn elevate_if_system_service(service_info: &ServiceInfo) {
+    if service_info.scope == "system" && !is_root() {
+        ensure_sudo_timestamp();
+        let args: Vec<String> = env::args().skip(1).collect();
+        elevate_privileges(&args, &[]);
+    }
 }
 
 fn resolve_service(arg: Option<ServiceName>) -> ServiceInfo {
     let services = list_corky_services();
 
     if services.is_empty() {
-        eprintln!("{C_RED}[ERROR]{C_RESET} No Corky services found. You may need to install a service first.");
-        std::process::exit(1);
+        exit_error("No Corky services found. You may need to install a service first.");
     }
 
-    let service_name = match arg {
+    match arg {
         Some(ServiceName::Auto) => {
             if services.len() == 1 {
-                services[0].0.clone()
+                services[0].clone()
             } else {
                 eprintln!("{C_YELLOW}[WARN]{C_RESET} Multiple services found. Please specify one:");
-                for (i, (service, scope)) in services.iter().enumerate() {
-                    eprintln!("  {}. {} ({})", i + 1, service, scope);
+                for (i, s) in services.iter().enumerate() {
+                    eprintln!("  {}. {} ({})", i + 1, s.name, s.scope);
                 }
                 std::process::exit(1);
             }
         }
         Some(ServiceName::All) => {
-            eprintln!("{C_RED}[ERROR]{C_RESET} Cannot perform this operation on all services. Specify one.");
-            std::process::exit(1);
+            exit_error("Cannot perform this operation on all services. Specify one.");
         }
         Some(ServiceName::Interactive) => {
-            if services.is_empty() {
-                eprintln!("{C_RED}[ERROR]{C_RESET} No services to select from.");
-                std::process::exit(1);
-            }
-            let options: Vec<String> = services
-                .iter()
-                .map(|(name, scope)| {
-                    let display_name = name.replace("corky-", "");
-                    format!("{} ({})", display_name, scope)
-                })
-                .collect();
-
-            match inquire::Select::new("Select a service:", options.clone()).prompt() {
-                Ok(selected) => {
-                    let index = options.iter().position(|o| o == &selected).unwrap();
-                    services[index].0.clone()
-                }
-                Err(_) => {
-                    eprintln!("{C_YELLOW}[WARN]{C_RESET} Service selection cancelled.");
-                    std::process::exit(1);
-                }
-            }
+            interactive_select_service(&services)
         }
         Some(ServiceName::Custom(name)) => {
-            let name_with_prefix = if !name.starts_with("corky-") {
-                format!("corky-{}", name)
-            } else {
-                name
-            };
+            let name_with_prefix = ensure_corky_prefix(&name);
 
             let matches: Vec<_> = services
                 .iter()
-                .filter(|(service, _)| service == &name_with_prefix)
+                .filter(|s| s.name == name_with_prefix)
                 .collect();
 
             if matches.is_empty() {
                 eprintln!("{C_RED}[ERROR]{C_RESET} No service found with name: {}", name_with_prefix);
                 eprintln!("Available services:");
-                for (service, scope) in &services {
-                    eprintln!("  {} ({})", service, scope);
+                for s in &services {
+                    eprintln!("  {} ({})", s.name, s.scope);
                 }
                 std::process::exit(1);
             } else if matches.len() > 1 {
                 eprintln!("{C_YELLOW}[WARN]{C_RESET} Multiple services match: {}", name_with_prefix);
-                for (i, (service, scope)) in matches.iter().enumerate() {
-                    eprintln!("  {}. {} ({})", i + 1, service, scope);
+                for (i, s) in matches.iter().enumerate() {
+                    eprintln!("  {}. {} ({})", i + 1, s.name, s.scope);
                 }
                 std::process::exit(1);
             } else {
-                matches[0].0.clone()
+                matches[0].clone()
             }
         }
         None => {
             if services.len() == 1 {
-                services[0].0.clone()
+                services[0].clone()
             } else {
-                let options: Vec<String> = services
-                    .iter()
-                    .map(|(name, scope)| {
-                        let display_name = name.replace("corky-", "");
-                        format!("{} ({})", display_name, scope)
-                    })
-                    .collect();
-
-                match inquire::Select::new("Select a service:", options.clone()).prompt() {
-                    Ok(selected) => {
-                        let index = options.iter().position(|o| o == &selected).unwrap();
-                        services[index].0.clone()
-                    }
-                    Err(_) => {
-                        eprintln!("{C_YELLOW}[WARN]{C_RESET} Service selection cancelled.");
-                        std::process::exit(1);
-                    }
-                }
+                interactive_select_service(&services)
             }
         }
-    };
-
-    let scope = services
-        .iter()
-        .find(|(name, _)| name == &service_name)
-        .map(|(_, scope)| scope.clone())
-        .unwrap_or_else(|| "system".to_string());
-
-    ServiceInfo { name: service_name, scope }
+    }
 }
 
 fn run_systemctl(action: &str, service_info: &ServiceInfo) {
-    if service_info.scope == "system" && !is_root() {
-        ensure_sudo_timestamp();
-        let args: Vec<String> = env::args().skip(1).collect();
-        elevate_privileges(&args);
-    }
+    elevate_if_system_service(service_info);
 
     let mut cmd = Command::new("systemctl");
     if service_info.scope == "user" {
@@ -830,11 +947,7 @@ fn run_systemctl(action: &str, service_info: &ServiceInfo) {
 }
 
 fn run_systemctl_logs(service_info: &ServiceInfo) {
-    if service_info.scope == "system" && !is_root() {
-        ensure_sudo_timestamp();
-        let args: Vec<String> = env::args().skip(1).collect();
-        elevate_privileges(&args);
-    }
+    elevate_if_system_service(service_info);
 
     let mut cmd = Command::new("journalctl");
     if service_info.scope == "user" {

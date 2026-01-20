@@ -8,6 +8,8 @@ clap = { version = "4.0", features = ["derive"] }
 clap_complete = "4.0"
 inquire = "0.6"  # For interactive service selection
 libc = "0.2"     # For checking root privileges
+toml = "0.8"     # For parsing Cargo.toml
+serde = { version = "1.0", features = ["derive"] }  # For deserializing TOML
 
 [corky]
 is_corky_package = true
