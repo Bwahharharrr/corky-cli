@@ -108,12 +108,20 @@ enum Commands {
         /// Run in dry-run mode (no actual changes made)
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip systemd service registration (install binary and unit file only)
+        #[arg(long)]
+        skip_service: bool,
     },
     /// Uninstall corky services (system service)
     Uninstall {
         /// Run in dry-run mode (no actual changes made)
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip systemd service operations (remove binary and unit file only)
+        #[arg(long)]
+        skip_service: bool,
     },
     /// View logs for a corky service
     Logs {
@@ -285,8 +293,8 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Install { dry_run } => install_system_service(*dry_run),
-        Commands::Uninstall { dry_run } => uninstall_system_service(*dry_run),
+        Commands::Install { dry_run, skip_service } => install_system_service(*dry_run, *skip_service),
+        Commands::Uninstall { dry_run, skip_service } => uninstall_system_service(*dry_run, *skip_service),
         Commands::Logs { service } => {
             let service_info = resolve_service(service.clone());
             run_systemctl_logs(&service_info);
@@ -336,47 +344,48 @@ fn main() {
 // INSTALL / UNINSTALL (Pure Rust) — no empty sections
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn install_system_service(dry_run: bool) {
-    // Phase 1 (user): validate + build, then elevate. No empty "Elevation" section.
-    if !is_root() {
-        section("Validating Corky package");
-        validate_corky_package_or_exit();
-        println!("{C_BGREEN}[OK]{C_RESET} {C_WHITE}Found Cargo.toml with [corky] is_corky_package=true{C_RESET}");
+fn install_system_service(dry_run: bool, skip_service: bool) {
+    // Step 1: Always validate (works as root or non-root)
+    section("Validating Corky package");
+    validate_corky_package_or_exit();
+    println!("{C_BGREEN}[OK]{C_RESET} {C_WHITE}Found Cargo.toml with [corky] is_corky_package=true{C_RESET}");
 
-        section("Building (release)");
-        if dry_run {
-            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: cargo build --release");
-        } else {
-            println!("{C_GREEN}[INFO]{C_RESET} Running: cargo build --release");
-            let status = Command::new("cargo")
-                .arg("build")
-                .arg("--release")
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .expect("Failed to run cargo build --release");
-            if !status.success() {
-                eprintln!("{C_RED}[ERROR]{C_RESET} cargo build --release failed.");
-                std::process::exit(status.code().unwrap_or(1));
-            }
+    // Step 2: Always build (works as root or non-root)
+    section("Building (release)");
+    if dry_run {
+        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: cargo build --release");
+    } else {
+        println!("{C_GREEN}[INFO]{C_RESET} Running: cargo build --release");
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("--release")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("Failed to run cargo build --release");
+        if !status.success() {
+            eprintln!("{C_RED}[ERROR]{C_RESET} cargo build --release failed.");
+            std::process::exit(status.code().unwrap_or(1));
         }
+    }
 
-        // Compute checksum of built binary for TOCTOU protection
-        let (raw_pkg_name, _) = pkg_name_and_description().unwrap_or_else(|| {
-            ("corky".to_string(), "corky service".to_string())
-        });
-        let target_bin = Path::new("target").join("release").join(&raw_pkg_name);
-        let checksum = if !dry_run {
-            compute_file_checksum(&target_bin).unwrap_or_else(|| {
-                eprintln!("{C_RED}[ERROR]{C_RESET} Failed to compute checksum of {}", target_bin.display());
-                std::process::exit(1);
-            })
-        } else {
-            String::new()
-        };
+    // Step 3: Compute checksum of built binary for TOCTOU protection
+    let (raw_pkg_name, _) = pkg_name_and_description().unwrap_or_else(|| {
+        ("corky".to_string(), "corky service".to_string())
+    });
+    let target_bin = Path::new("target").join("release").join(&raw_pkg_name);
+    let checksum = if !dry_run {
+        compute_file_checksum(&target_bin).unwrap_or_else(|| {
+            eprintln!("{C_RED}[ERROR]{C_RESET} Failed to compute checksum of {}", target_bin.display());
+            std::process::exit(1);
+        })
+    } else {
+        String::new()
+    };
 
-        // Single, informative line instead of an empty heading
+    // Step 4: Elevate only if not already root
+    if !is_root() {
         println!("{C_GREEN}[INFO]{C_RESET} Elevating with sudo to install system service…");
         let args: Vec<String> = env::args().skip(1).collect();
         elevate_privileges(&args, &[(ENV_BINARY_CHECKSUM, &checksum)]);
@@ -505,29 +514,66 @@ WantedBy=multi-user.target
         println!("{C_GREEN}[INFO]{C_RESET} Wrote unit: {}", unit_path.display());
     }
 
+    // Determine if we should skip systemd service registration
+    let systemd_available = is_systemd_available();
+    let skip_systemd = skip_service || !systemd_available;
+
+    if skip_systemd && !dry_run {
+        if !systemd_available {
+            println!("\n{C_YELLOW}[NOTICE]{C_RESET} systemd is not available (not running as init system).");
+            println!("{C_YELLOW}[NOTICE]{C_RESET} Skipping service registration. Binary and unit file installed.");
+        } else {
+            println!("\n{C_YELLOW}[NOTICE]{C_RESET} --skip-service specified. Skipping service registration.");
+        }
+    }
+
     section("Reloading & enabling service");
     if dry_run {
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl enable {}", service_name);
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl start {}", service_name);
-        return;
-    }
-    run_cmd_expect_ok("systemctl", &["daemon-reload"]);
-    run_cmd_expect_ok("systemctl", &["enable", &service_name]);
-    let ok = run_cmd("systemctl", &["start", &service_name]);
-    if !ok {
-        eprintln!("{C_RED}[ERROR]{C_RESET} Failed to start service. Try: systemctl status {}", service_name);
-        std::process::exit(1);
+        if skip_service {
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} --skip-service: Would skip systemctl commands");
+        } else {
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl enable {}", service_name);
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl start {}", service_name);
+        }
+    } else if skip_systemd {
+        println!("{C_YELLOW}[SKIP]{C_RESET} systemctl daemon-reload");
+        println!("{C_YELLOW}[SKIP]{C_RESET} systemctl enable {}", service_name);
+        println!("{C_YELLOW}[SKIP]{C_RESET} systemctl start {}", service_name);
+    } else {
+        run_cmd_expect_ok("systemctl", &["daemon-reload"]);
+        run_cmd_expect_ok("systemctl", &["enable", &service_name]);
+        let ok = run_cmd("systemctl", &["start", &service_name]);
+        if !ok {
+            eprintln!("{C_RED}[ERROR]{C_RESET} Failed to start service. Try: systemctl status {}", service_name);
+            std::process::exit(1);
+        }
     }
 
     section("Done");
-    println!("{C_BGREEN}[SUCCESS]{C_RESET} {} installed and started.", service_name);
-    println!("• Binary: {}", install_bin.display());
-    println!("• Unit:   {}", unit_path.display());
-    println!("→ Manage with: systemctl [status|restart|stop] {}", service_name);
+    if skip_systemd && !dry_run {
+        println!("{C_BGREEN}[SUCCESS]{C_RESET} {} installed (binary + unit file).", service_name);
+        println!("• Binary: {}", install_bin.display());
+        println!("• Unit:   {}", unit_path.display());
+        println!();
+        println!("To run manually:");
+        println!("  cd {} && {}", cwd.display(), install_bin.display());
+        println!();
+        println!("To run in background (with nohup):");
+        println!("  cd {} && nohup {} > /var/log/{}.log 2>&1 &", cwd.display(), install_bin.display(), service_name);
+        println!();
+        println!("On a systemd system, enable with:");
+        println!("  sudo systemctl daemon-reload");
+        println!("  sudo systemctl enable --now {}", service_name);
+    } else {
+        println!("{C_BGREEN}[SUCCESS]{C_RESET} {} installed and started.", service_name);
+        println!("• Binary: {}", install_bin.display());
+        println!("• Unit:   {}", unit_path.display());
+        println!("→ Manage with: systemctl [status|restart|stop] {}", service_name);
+    }
 }
 
-fn uninstall_system_service(dry_run: bool) {
+fn uninstall_system_service(dry_run: bool, skip_service: bool) {
     // Phase 1 (user): elevate, no empty headings.
     if !is_root() {
         println!("{C_GREEN}[INFO]{C_RESET} Elevating with sudo to uninstall system service…");
@@ -552,11 +598,31 @@ fn uninstall_system_service(dry_run: bool) {
     let unit_path = Path::new(UNIT_DIR_SYSTEM).join(&unit);
     let bin_path = Path::new(BIN_PATH_SYSTEM).join(&raw_pkg_name);
 
+    // Determine if we should skip systemd service operations
+    let systemd_available = is_systemd_available();
+    let skip_systemd = skip_service || !systemd_available;
+
+    if skip_systemd && !dry_run {
+        if !systemd_available {
+            println!("{C_YELLOW}[NOTICE]{C_RESET} systemd is not available (not running as init system).");
+            println!("{C_YELLOW}[NOTICE]{C_RESET} Skipping service operations. Will remove binary and unit file only.");
+        } else {
+            println!("{C_YELLOW}[NOTICE]{C_RESET} --skip-service specified. Skipping service operations.");
+        }
+    }
+
     // Stop & disable if present
     section("Stopping & disabling");
     if dry_run {
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl stop {}", service_name);
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl disable {}", service_name);
+        if skip_service {
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} --skip-service: Would skip systemctl commands");
+        } else {
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl stop {}", service_name);
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl disable {}", service_name);
+        }
+    } else if skip_systemd {
+        println!("{C_YELLOW}[SKIP]{C_RESET} systemctl stop {}", service_name);
+        println!("{C_YELLOW}[SKIP]{C_RESET} systemctl disable {}", service_name);
     } else {
         // best-effort; we keep stdout/stderr inherited so the user sees real actions (like symlink removal)
         let _ = run_cmd("systemctl", &["stop", &service_name]);
@@ -567,8 +633,10 @@ fn uninstall_system_service(dry_run: bool) {
     section("Removing unit & reloading daemon");
     if dry_run {
         println!("{C_CYAN}[DRY-RUN]{C_RESET} Would remove: {}", unit_path.display());
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
-        println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl reset-failed {}", service_name);
+        if !skip_service {
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl daemon-reload");
+            println!("{C_CYAN}[DRY-RUN]{C_RESET} Would run: systemctl reset-failed {}", service_name);
+        }
     } else {
         if unit_path.exists() {
             println!("{C_GREEN}[INFO]{C_RESET} Removing unit {}", unit_path.display());
@@ -578,9 +646,14 @@ fn uninstall_system_service(dry_run: bool) {
         } else {
             println!("{C_YELLOW}[WARN]{C_RESET} Unit not found at {}", unit_path.display());
         }
-        run_cmd_expect_ok("systemctl", &["daemon-reload"]);
-        // Quiet best-effort: suppress any "not loaded" noise
-        let _ = run_cmd_quiet("systemctl", &["reset-failed", &service_name]);
+        if skip_systemd {
+            println!("{C_YELLOW}[SKIP]{C_RESET} systemctl daemon-reload");
+            println!("{C_YELLOW}[SKIP]{C_RESET} systemctl reset-failed {}", service_name);
+        } else {
+            run_cmd_expect_ok("systemctl", &["daemon-reload"]);
+            // Quiet best-effort: suppress any "not loaded" noise
+            let _ = run_cmd_quiet("systemctl", &["reset-failed", &service_name]);
+        }
     }
 
     // Remove binary
@@ -607,6 +680,11 @@ fn section(title: &str) {
     println!("\n{C_BLUE}╔══════════════════════════════════════════════════════════╗{C_RESET}");
     println!("{C_BLUE}║{C_RESET} {C_WHITE}{C_BOLD}{:<54}{C_RESET} {C_BLUE}║{C_RESET}", title);
     println!("{C_BLUE}╚══════════════════════════════════════════════════════════╝{C_RESET}");
+}
+
+/// Check if systemd is available as the init system.
+fn is_systemd_available() -> bool {
+    Path::new("/run/systemd/system").exists()
 }
 
 fn validate_corky_package_or_exit() {
